@@ -26,4 +26,3 @@ sudo systemctl daemon-reload
 echo ">>> DONE!"
 echo "⚠️  IMPORTANT: Unplug & replug the MTi-710"
 echo "⚠️  Log out and log in again so plugdev group takes effect."
-echo "Run chmod +x fix_mti710_permissions.sh "
