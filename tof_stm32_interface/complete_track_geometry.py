@@ -16,7 +16,6 @@ def get_imu_data():
             print(f"Received from other folder: {line.strip()}")
                           
             # Add your logic here to sync with camera
-            x  
 if __name__ == "__main__":
     get_imu_data()
 
