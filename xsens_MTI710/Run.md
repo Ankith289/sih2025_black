@@ -32,7 +32,12 @@ g++ mti710_new.cpp -o mti710_force_log -lusb-1.0 -O2 -pthread
 # Fourth
 
 Run
+```
+mkfifo /tmp/xsens_pipe
+```
+# Fifth
 
 ```
-sudo ./mti710_force_log |python3 plot_data.py 
+# Run driver and send output to the pipe
+sudo ./mti710_logger > /tmp/xsens_pipe
 ```
