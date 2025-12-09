@@ -45,5 +45,5 @@ sudo ./mti710_force_log > /tmp/xsens_pipe
 ```
 
 ```
-sudo .~/sih2025_black/xsens_MTI710/mti710_force_log > /tmp/xsens_pipe
+sudo ./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe
 ```
