@@ -8,16 +8,19 @@ import serial
 # --- CONFIGURATION ---
 PIPE_PATH = "/tmp/xsens_pipe"
 
-angle1 = math.degrees(30)
-angle2 = math.degrees(60)
+# angles in RADIANS (correct for trigonometry)
+angle1 = math.radians(30)
+angle2 = math.radians(60)
 
 previous_cross_level = 0.0
+prev_time = None
+
+
+# ===============================
+# IMU PIPE THREAD
+# ===============================
 
 class IMUListener(threading.Thread):
-    """
-    Background thread that reads the text pipe from the C++ Driver.
-    Does not block the main ToF loop.
-    """
     def __init__(self, pipe_path):
         super().__init__()
         self.pipe_path = pipe_path
@@ -26,19 +29,19 @@ class IMUListener(threading.Thread):
         self.data = {
             'ax': 0.0, 'ay': 0.0, 'az': 0.0,
             'gx': 0.0, 'gy': 0.0, 'gz': 0.0,
-            'qw': 0.0, 'qx': 0.0, 'qy': 0.0, 'qz': 0.0
+            'qw': 0.0
         }
 
     def run(self):
-        # Wait for C++ driver to create the pipe
         while not os.path.exists(self.pipe_path):
             time.sleep(0.5)
 
         print(f"IMU: Connected to {self.pipe_path}")
+
         try:
             with open(self.pipe_path, 'r') as fifo:
                 while self.running:
-                    line = fifo.readline()
+                    line = fifo.readline().strip()
                     if not line:
                         time.sleep(0.01)
                         continue
@@ -47,10 +50,8 @@ class IMUListener(threading.Thread):
             print(f"IMU Pipe Error: {e}")
 
     def _parse(self, line):
-        """Parses: QUAT: ... ACC: ... GYRO: ..."""
         parts = line.split()
         try:
-            # We iterate through the line looking for keywords
             for i, tag in enumerate(parts):
                 if tag == "ACC:":
                     self.data['ax'] = float(parts[i+1])
@@ -61,18 +62,19 @@ class IMUListener(threading.Thread):
                     self.data['gy'] = float(parts[i+2])
                     self.data['gz'] = float(parts[i+3])
                 elif tag == "QUAT:":
-                    # If you need orientation
                     self.data['qw'] = float(parts[i+1])
-        except (IndexError, ValueError):
+        except:
             pass
 
     def get_data(self):
         return self.data
 
+
+# ===============================
+# UART ToF Reader
+# ===============================
+
 class ToFArrayReader:
-    """
-    Reads 4 distances (8 bytes) via UART from Blue Pill.
-    """
     def __init__(self, port="/dev/ttyTHS1", baud=115200):
         self.port = port
         self.baud = baud
@@ -82,6 +84,8 @@ class ToFArrayReader:
     def connect(self):
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            time.sleep(0.2)
+            self.ser.reset_input_buffer()
             print("UART: Connected to Blue Pill.")
         except Exception as e:
             print(f"UART Connection Error: {e}")
@@ -91,85 +95,96 @@ class ToFArrayReader:
             return self.distances
 
         try:
-            # Read exactly 8 bytes (d1,d2,d3,d4)
             data = self.ser.read(8)
             if len(data) == 8:
-                # Little-endian unsigned short  (matching Blue Pill)
                 self.distances = list(struct.unpack("<HHHH", data))
         except:
             pass
 
         return self.distances
 
-def safety_calculation(imu, tofs,previous_cross_level):
-    """
-    Your custom logic combining 4 distances + Accelerometer
-    """
-    # Unpack for clarity
-    d1, d2, d3, d4 = tofs 
-    acc_x = imu['ax']
-    acc_y = imu['ay']
-    acc_z = imu['az']
-    gyro_z = imu['gz']
 
-    decision = "CLEAR"
-    
-    # 1. Gauge
-    gauge_width = (d1*math.sin(angle1))+(d2*math.sin(angle2))
-    
-    # 2.cross_level
-    down= math.sqrt(pow(abs(acc_x),2)+pow(abs(acc_y),2))
-    if 9 < down and down < 10 and abs(acc_y)<9:
-        cross_level_angle = math.degrees(math.asin(acc_y/down))
-        cross_level= math.sin(math.radians(cross_level_angle))*gauge_width
+# ===============================
+# SAFETY GEOMETRY CALCULATION
+# ===============================
+
+def safety_calculation(imu, tofs, previous_cross_level, prev_time):
+    """
+    Pure math version — NO thresholds.
+    Computes:
+    gauge_width
+    cross_level (from tilt)
+    twist_level = derivative (dt-based)
+    """
+
+    # unpack
+    d1, d2, d3, d4 = tofs
+    ax, ay, az = imu['ax'], imu['ay'], imu['az']
+
+    # 1) GAUGE WIDTH
+    gauge_width = (d1 * math.sin(angle1)) + (d2 * math.sin(angle2))
+
+    # 2) CROSS LEVEL (projection of lateral accel)
+    #    We use atan2-based tilt instead of asin to avoid domain issues.
+    if az != 0:
+        tilt_angle = math.atan2(ay, az)      # radians
     else:
-        cross_level=0
-    
-    # 3. twist_level
-    twist = cross_level - previous_cross_level
+        tilt_angle = 0.0
 
-    previous_cross_level =cross_level
+    cross_level = math.sin(tilt_angle) * gauge_width
 
-    
+    # 3) TIME-BASED TWIST LEVEL
+    now = time.time()
 
-    # 4. curve_level
-    
+    if prev_time is None:
+        dt = 0.05
+    else:
+        dt = max(1e-6, now - prev_time)
 
-    decision = {"gauge_width": gauge_width,
-                "cross_level": cross_level,
-                "curve_level": 0
-                }
+    twist_level = (cross_level - previous_cross_level) / dt
 
-    return decision
-# --- MAIN LOOP ---
+    # Construct output
+    decision = {
+        "gauge_width": gauge_width,
+        "cross_level": cross_level,
+        "twist_level": twist_level,
+    }
+
+    return decision, cross_level, now
+
+
+
+# ===============================
+# MAIN LOOP
+# ===============================
+
 if __name__ == "__main__":
-    # 1. Start IMU Thread (Reads the Pipe)
+
     imu_thread = IMUListener(PIPE_PATH)
     imu_thread.start()
 
-    # 2. Setup I2C (Reads the Blue Pill)
-    tof_array = ToFArrayReader("/dev/ttyTHS1", 115200)
-    tof_array.connect()
+    tof_reader = ToFArrayReader("/dev/ttyTHS1", 115200)
+    tof_reader.connect()
 
     print("Fusion System Started...")
-prev_time = None
+
+    previous_cross_level = 0.0
+    prev_time = None
+
     try:
         while True:
-            # A. Get Synchronized Data
             imu_data = imu_thread.get_data()
-            tof_data = tof_array.read() # Returns [d1, d2, d3, d4]
-            
-            # B. Run Logic
-            decision, previous_cross_level, prev_time = safety_calculation(imu_data, tof_data, previous_cross_level, prev_time)
-            # C. Print
-            # Using f-strings to format nicely
+            tof_data = tof_reader.read()
+
+            decision, previous_cross_level, prev_time =
+                safety_calculation(imu_data, tof_data, previous_cross_level, prev_time)
+
             print(f"TOF: {tof_data} | "
                   f"ACC: {imu_data['ax']:.2f} | "
-                  f"STATUS: {status}", end='\r')
+                  f"STATUS: {decision}", end="\r")
 
-            time.sleep(0.05) # 20Hz
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\nStopping...")
         imu_thread.running = False
-
