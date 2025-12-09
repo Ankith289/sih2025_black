@@ -47,3 +47,6 @@ sudo ./mti710_force_log > /tmp/xsens_pipe
 ```
 sudo ./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe
 ```
+```
+sudo ./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe |python3 ~/sih2025_black/tof_stm32_interface/complete_track_geometry.py
+```
