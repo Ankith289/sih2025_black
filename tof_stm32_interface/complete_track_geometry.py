@@ -101,50 +101,108 @@ class ToFArrayReader:
 
         return self.distances
 
-def safety_calculation(imu, tofs,previous_cross_level):
+import math
+import time
+
+# Tunable constants (move to config)
+ANGLE1_DEG = 30.0
+ANGLE2_DEG = 60.0
+ANGLE1 = math.radians(ANGLE1_DEG)
+ANGLE2 = math.radians(ANGLE2_DEG)
+GRAVITY = 9.80665           # m/s^2
+GRAVITY_TOLERANCE = 0.25    # acceptable deviation (m/s^2)
+ACC_Y_MAX = 9.0             # used in your original logic (but we'll use more robust test)
+MIN_VALID_TOF = 1           # mm
+MAX_VALID_TOF = 20000       # mm
+EMA_ALPHA = 0.3             # smoothing for ToF and cross_level
+
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def safety_calculation(imu, tofs, previous_cross_level, prev_time=None):
     """
-    Your custom logic combining 4 distances + Accelerometer
+    imu: dict with 'ax','ay','az','gx','gy','gz', optionally quaternions
+    tofs: list/iterable of 4 distance values (units: mm)
+    previous_cross_level: previous cross_level (units: mm)
+    prev_time: previous timestamp (seconds); if None, dt will be approximated as 0.05s
+
+    Returns: (decision_dict, updated_previous_cross_level, timestamp)
     """
-    # Unpack for clarity
-    d1, d2, d3, d4 = tofs
-    acc_x = imu['ax']
-    acc_y = imu['ay']
-    acc_z = imu['az']
-    gyro_x = imu['gx']
-    gyro_y = imu['gy']
-    gyro_z = imu['gz']
-
-    decision = "CLEAR"
-
-    # 1. Gauge
-    gauge_width = (d1*math.sin(angle1))+(d2*math.sin(angle2))
-
-    # 2.cross_level
-    down= math.sqrt(pow(abs(acc_y),2)+pow(abs(acc_z),2))
-    if 9 < down and down < 10 and abs(acc_z)<9:
-        cross_level_angle = math.degrees(math.asin(acc_z/down))
-        cross_level= math.sin(math.radians(cross_level_angle))*gauge_width
+    now = time.time()
+    if prev_time is None:
+        dt = 0.05
     else:
-        cross_level=0
+        dt = max(1e-6, now - prev_time)
 
-    # 3. twist_level
-    twist = cross_level - previous_cross_level
+    # --- sanitize ToF readings ---
+    d = []
+    for v in tofs:
+        try:
+            vv = int(v)
+        except Exception:
+            vv = 0
+        # reject obviously invalid readings
+        if vv < MIN_VALID_TOF or vv > MAX_VALID_TOF:
+            vv = 0
+        d.append(vv)
+    d1, d2, d3, d4 = d
 
-    previous_cross_level =cross_level
+    # If too many invalids, return a safe default
+    valid_count = sum(1 for x in d if x > 0)
+    if valid_count < 2:
+        # not enough sensors online
+        decision = {"gauge_width": 0.0, "cross_level": previous_cross_level,
+                    "twist_level": 0.0, "previous_cross_level": previous_cross_level,
+                    "curve_level": 0.0, "status": "TOF_FAIL"}
+        return decision, previous_cross_level, now
 
+    # --- accelerometer magnitude ---
+    ax = float(imu.get('ax', 0.0))
+    ay = float(imu.get('ay', 0.0))
+    az = float(imu.get('az', 0.0))
+    down = math.sqrt(ax*ax + ay*ay + az*az)  # total accel magnitude
 
+    # Is sensor near gravity? (simple stationary check)
+    near_gravity = abs(down - GRAVITY) < GRAVITY_TOLERANCE + 0.2  # allow small extra slack
 
-    # 4. curve_level
+    # compute gauge_width (in mm). convert trig inputs to use radians angles
+    gauge_width = 0.0
+    try:
+        gauge_width = (d1 * math.sin(ANGLE1)) + (d2 * math.sin(ANGLE2))
+    except Exception:
+        gauge_width = 0.0
 
+    # compute cross_level using ax/ay. If IMU oriented differently, replace with corrected axis.
+    cross_level = 0.0
+    if near_gravity and abs(ay) < GRAVITY + 1.0:
+        # derive small angle using asin, ensure argument safe
+        denom = max(1e-6, down)
+        asin_arg = clamp(ay / denom, -1.0, 1.0)
+        cross_level_angle = math.degrees(math.asin(asin_arg))
+        cross_level = math.sin(math.radians(cross_level_angle)) * gauge_width
+    else:
+        # fallback — set cross_level to previous filtered value
+        cross_level = previous_cross_level
 
-    decision = {"gauge_width": gauge_width,
-                "cross_level": cross_level,
-                "twist_level": twist,
-                "previous_cross_level": previous_cross_level,
-                "curve_level": 0
-                }
+    # apply simple exponential filter to cross_level to smooth noise
+    filtered_cross = EMA_ALPHA * cross_level + (1.0 - EMA_ALPHA) * previous_cross_level
 
-    return decision ,previous_cross_level
+    # twist level: rate of change (mm / s)
+    twist_level = (filtered_cross - previous_cross_level) / dt
+
+    # curve_level placeholder (could use yaw rate from IMU gx/gy/gz or ToF asymmetry)
+    curve_level = 0.0
+
+    decision = {
+        "gauge_width": gauge_width,
+        "cross_level": filtered_cross,
+        "twist_level": twist_level,
+        "previous_cross_level": filtered_cross,
+        "curve_level": curve_level,
+        "status": "OK"
+    }
+
+    return decision, filtered_cross, now
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
@@ -157,17 +215,15 @@ if __name__ == "__main__":
     tof_array.connect()
 
     print("Fusion System Started...")
-
+prev_time = None
     try:
         while True:
             # A. Get Synchronized Data
             imu_data = imu_thread.get_data()
             tof_data = tof_array.read() # Returns [d1, d2, d3, d4]
-
+            
             # B. Run Logic
-            status, previous_cross_level = safety_calculation(imu_data, tof_data, previous_cross_level)
-
-
+            decision, previous_cross_level, prev_time = safety_calculation(imu_data, tof_data, previous_cross_level, prev_time)
             # C. Print
             # Using f-strings to format nicely
             print(f"TOF: {tof_data} | "
