@@ -3,12 +3,10 @@ import os
 import time
 import threading
 import struct
-from smbus2 import SMBus
+import serial
 
 # --- CONFIGURATION ---
 PIPE_PATH = "/tmp/xsens_pipe"
-I2C_BUS_ID = 1           # Jetson AGX Orin usually uses Bus 1 or 7
-TOF_ADDR = 0x42          # <--- Replace with your Blue Pill Address
 
 angle1 = math.degrees(30)
 angle2 = math.degrees(60)
@@ -35,7 +33,7 @@ class IMUListener(threading.Thread):
         # Wait for C++ driver to create the pipe
         while not os.path.exists(self.pipe_path):
             time.sleep(0.5)
-            
+
         print(f"IMU: Connected to {self.pipe_path}")
         try:
             with open(self.pipe_path, 'r') as fifo:
@@ -73,40 +71,34 @@ class IMUListener(threading.Thread):
 
 class ToFArrayReader:
     """
-    Reads 4 ToF sensors via I2C.
-    Expects 8 bytes total.
+    Reads 4 distances (8 bytes) via UART from Blue Pill.
     """
-    def __init__(self, bus_id, address):
-        self.bus_id = bus_id
-        self.address = address
-        self.bus = None
-        # Default values if read fails
-        self.distances = [0, 0, 0, 0] 
+    def __init__(self, port="/dev/ttyTHS1", baud=115200):
+        self.port = port
+        self.baud = baud
+        self.ser = None
+        self.distances = [0,0,0,0]
 
     def connect(self):
         try:
-            self.bus = SMBus(self.bus_id)
-            print("TOF: I2C Connected.")
+            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            print("UART: Connected to Blue Pill.")
         except Exception as e:
-            print(f"TOF: Connection Error: {e}")
+            print(f"UART Connection Error: {e}")
 
     def read(self):
-        if not self.bus: return self.distances
+        if not self.ser:
+            return self.distances
 
         try:
-            # Read 8 bytes (4 sensors * 2 bytes each)
-            # Register 0x00 is standard, change if your Blue Pill needs a specific reg
-            block = self.bus.read_i2c_block_data(self.address, 0x00, 8)
-            
-            # Unpack 4 unsigned short integers (2 bytes each)
-            # >HHHH means Big Endian, 4 items, unsigned short
-            # If values look crazy (e.g. 256mm becomes 1mm), change '>' to '<'
-            self.distances = list(struct.unpack('>HHHH', bytes(block)))
-            
-        except OSError:
-            # Keep previous values on temporary I2C fail
+            # Read exactly 8 bytes (d1,d2,d3,d4)
+            data = self.ser.read(8)
+            if len(data) == 8:
+                # Little-endian unsigned short  (matching Blue Pill)
+                self.distances = list(struct.unpack("<HHHH", data))
+        except:
             pass
-            
+
         return self.distances
 
 def safety_calculation(imu, tofs,previous_cross_level):
@@ -114,7 +106,7 @@ def safety_calculation(imu, tofs,previous_cross_level):
     Your custom logic combining 4 distances + Accelerometer
     """
     # Unpack for clarity
-    d1, d2, d3, d4 = tofs 
+    d1, d2, d3, d4 = tofs
     acc_x = imu['ax']
     acc_y = imu['ay']
     acc_z = imu['az']
@@ -123,27 +115,27 @@ def safety_calculation(imu, tofs,previous_cross_level):
     gyro_z = imu['gz']
 
     decision = "CLEAR"
-    
+
     # 1. Gauge
     gauge_width = (d1*math.sin(angle1))+(d2*math.sin(angle2))
-    
+
     # 2.cross_level
-    down= math.sqrt(pow(abs(acc_x),2)+pow(abs(acc_y),2))
-    if 9 < down and down < 10 and abs(acc_y)<9:
-        cross_level_angle = math.degrees(math.asin(acc_y/down))
+    down= math.sqrt(pow(abs(acc_y),2)+pow(abs(acc_z),2))
+    if 9 < down and down < 10 and abs(acc_z)<9:
+        cross_level_angle = math.degrees(math.asin(acc_z/down))
         cross_level= math.sin(math.radians(cross_level_angle))*gauge_width
     else:
         cross_level=0
-    
+
     # 3. twist_level
     twist = cross_level - previous_cross_level
 
     previous_cross_level =cross_level
 
-    
+
 
     # 4. curve_level
-    
+
 
     decision = {"gauge_width": gauge_width,
                 "cross_level": cross_level,
@@ -152,7 +144,7 @@ def safety_calculation(imu, tofs,previous_cross_level):
                 "curve_level": 0
                 }
 
-    return decision
+    return decision ,previous_cross_level
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
@@ -161,11 +153,11 @@ if __name__ == "__main__":
     imu_thread.start()
 
     # 2. Setup I2C (Reads the Blue Pill)
-    tof_array = ToFArrayReader(I2C_BUS_ID, TOF_ADDR)
+    tof_array = ToFArrayReader("/dev/ttyTHS1", 115200)
     tof_array.connect()
 
     print("Fusion System Started...")
-    
+
     try:
         while True:
             # A. Get Synchronized Data
@@ -173,7 +165,8 @@ if __name__ == "__main__":
             tof_data = tof_array.read() # Returns [d1, d2, d3, d4]
 
             # B. Run Logic
-            status = safety_calculation(imu_data, tof_data)
+            status, previous_cross_level = safety_calculation(imu_data, tof_data, previous_cross_level)
+
 
             # C. Print
             # Using f-strings to format nicely
@@ -186,3 +179,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nStopping...")
         imu_thread.running = False
+
