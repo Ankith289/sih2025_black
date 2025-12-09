@@ -26,18 +26,24 @@ source env/bin/activate
 
 Run
 ```
-g++ mti710_new.cpp -o mti710_force_log -lusb-1.0 -O2 -pthread
+g++ raw_data_reciver.cpp -o mti710_force_log -lusb-1.0 -O2 -pthread
 ```
 
 # Fourth
 
 Run
 ```
+rm -f /tmp/xsens_pipe
 mkfifo /tmp/xsens_pipe
+
 ```
 # Fifth
 
 ```
 # Run driver and send output to the pipe
-sudo ./mti710_logger > /tmp/xsens_pipe
+sudo ./mti710_force_log > /tmp/xsens_pipe
+```
+
+```
+sudo .~/sih2025_black/xsens_MTI710/mti710_force_log > /tmp/xsens_pipe
 ```
