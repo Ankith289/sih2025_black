@@ -43,10 +43,10 @@ def calculate_track_parameters(d1, d2, velocity, ay, az, prev_cross, prev_time):
     # --- B. CROSS LEVEL (CANT) ---
     # Calculate tilt angle from accelerometer (ay, az)
     # atan2 handles the division by zero if az is 0
-    down= math.sqrt(pow(abs(acc_y),2)+pow(abs(acc_z),2))
-    if 9 < down and down < 10 and abs(acc_z)<9:
-        cross_level_angle = math.degrees(math.asin(acc_z/down))
-        cross_level= math.sin(math.radians(cross_level_angle))*gauge_width
+    down= math.sqrt(pow(abs(ay),2)+pow(abs(az),2))
+    if 9 < down and down < 10 and abs(az)<9:
+        cross_level_angle = math.degrees(math.asin(az/down))
+        cross_level= math.sin(math.radians(cross_level_angle))*gauge
     else:
         cross_level=0
     # --- C. TWIST (Spatial) ---
