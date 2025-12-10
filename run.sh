@@ -6,4 +6,5 @@ source env/bin/activate
 g++ xsens_MTI710/raw_data_reciver.cpp -o xsens_MTI710/mti710_force_log -lusb-1.0 -O2 -pthread
 rm -f /tmp/xsens_pipe
 mkfifo /tmp/xsens_pipe
-sudo ./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe |python3 tof_stm32_interface/complete_track_geometry.py
+./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe |python3 tof_stm32_interface/complete_track_geometry.py
+python3 condition/ml.py
