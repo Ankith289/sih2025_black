@@ -7,6 +7,7 @@ from datetime import datetime
 import serial
 import re
 import sys
+import zmq
 
 # ============================
 # GLOBAL TIMESTAMP READER
@@ -45,90 +46,43 @@ def build_fastener_packet(image_path, confidence, velocity):
 # ============================
 # UART CONFIG
 # ============================
-UART_PORT = "/dev/ttyTHS1"      # Change per subsystem if needed
-BAUD_RATE = 115200
-UART_TIMEOUT = 0.5
 # ============================
-# SHARED UART STATE
+# UART ZMQ SUBSCRIBER (from Time Master)
 # ============================
-class UARTState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.data = {}       # stores the latest parsed key/value pairs
+MASTER_ADDR = "tcp://127.0.0.1:6000"
 
-    def update(self, parsed_dict):
-        with self.lock:
-            for k, v in parsed_dict.items():
-                self.data[k] = v
-
-    def snapshot(self):
-        with self.lock:
-            return dict(self.data)
-
-uart_state = UARTState()
-
-# ============================
-# REGEX PARSER FOR UART LINES
-# (Handles key:value pairs in ANY order)
-# ============================
-UART_REGEX = re.compile(r"([A-Za-z0-9_]+)\s*[:=]\s*([-\d\.]+)")
-
-def parse_uart_line(line):
+def uart_zmq_worker():
     """
-    Takes a UART line like:
-      'D1:123 D2:456 Velocity:12.3 Trigger:1'
-    Returns:
-      {'D1':123, 'D2':456, 'Velocity':12.3, 'Trigger':1}
+    Listens to parsed UART data published by the UART Time Master.
     """
-    matches = UART_REGEX.findall(line)
-    parsed = {}
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(MASTER_ADDR)
 
-    for key, val in matches:
-        try:
-            # Auto-convert numeric fields
-            if "." in val:
-                parsed[key] = float(val)
-            else:
-                parsed[key] = int(val)
-        except:
-            parsed[key] = val  # fallback as string
+    # Subscribe to ALL messages
+    sub.setsockopt_string(zmq.SUBSCRIBE, "")
 
-    return parsed
-
-# ============================
-# UART WORKER THREAD
-# Reads lines & stores parsed results
-# ============================
-def uart_worker():
-    while True:
-        try:
-            ser = serial.Serial(
-                UART_PORT,
-                BAUD_RATE,
-                timeout=UART_TIMEOUT
-            )
-            sys.stderr.write(f"[UART] Connected on {UART_PORT}\n")
-            break
-        except Exception as e:
-            sys.stderr.write(f"[UART] Failed to open: {e}\n")
-            time.sleep(1)
-
-    ser.reset_input_buffer()
+    sys.stderr.write(f"[UART-ZMQ] Connected to UART Master at {MASTER_ADDR}\n")
 
     while True:
         try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if not line:
-                continue
+            msg = sub.recv_json()   # blocking read
 
-            parsed = parse_uart_line(line)
+            # Expected structure:
+            # { "d1":int, "d2":int, "velocity":float, "trigger":int, "distance":float, "timestamp":str }
 
-            if parsed:
-                uart_state.update(parsed)
-
+            uart_state.update({
+                "D1": msg.get("d1", 0),
+                "D2": msg.get("d2", 0),
+                "Velocity": msg.get("velocity", 0.0),
+                "Trigger": msg.get("trigger", 0),
+                "Distance": msg.get("distance", 0.0)
+            })
+        
         except Exception as e:
-            sys.stderr.write(f"[UART] Error: {e}\n")
-            continue
+            sys.stderr.write(f"[UART-ZMQ] Error: {e}\n")
+            time.sleep(0.1)
+
 # =====================================================================
 # Configuration
 # =====================================================================
@@ -150,7 +104,7 @@ os.makedirs(SAVE_PATH, exist_ok=True)
 model = YOLO(MODEL_PATH)
 model.fuse()
 print("Model loaded.")
-threading.Thread(target=uart_worker, daemon=True).start()
+threading.Thread(target=uart_zmq_worker, daemon=True).start()
 # =====================================================================
 # Threaded camera class
 # =====================================================================
