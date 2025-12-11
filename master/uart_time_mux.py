@@ -12,8 +12,9 @@ TS_FILE = "/tmp/global_timestamp.txt"
 PUB_ADDR = "tcp://127.0.0.1:6000"
 
 # Regex for Blue Pill data
-regex = re.compile(r"(D1|D2|Velocity|Trigger|Distance)\s*:\s*([\d\.]+)")
-
+uart_regex = re.compile(
+    r"D1:(\d+)\s+D2:(\d+)\s+Velocity:([0-9\.\-]+)\s+Trigger:([0-9])\s+Distance:([0-9\.\-]+)"
+)
 def write_timestamp(ts):
     """Writes global timestamp for ALL subsystems."""
     try:
@@ -22,23 +23,23 @@ def write_timestamp(ts):
     except:
         pass
 
-def parse_uart(line):
-    """Converts UART line into dict."""
-    matches = regex.findall(line)
-    if not matches:
+def parse_uart_line(line: str):
+    match = uart_regex.match(line)
+    if not match:
         return None
 
-    data = {}
-    for k, v in matches:
-        data[k] = float(v)
+    d1      = int(match.group(1))
+    d2      = int(match.group(2))
+    vel     = float(match.group(3))
+    trigger = int(match.group(4))
+    dist    = float(match.group(5))
 
     return {
-        "timestamp": datetime.now().isoformat(),
-        "d1": int(data.get("D1", 0)),
-        "d2": int(data.get("D2", 0)),
-        "distance": float(data.get("Distance", 0.0)),
-        "velocity": float(data.get("Velocity", 0.0)),
-        "trigger": int(data.get("Trigger", 0))
+        "d1": d1,
+        "d2": d2,
+        "velocity": vel,
+        "trigger": trigger,
+        "distance": dist
     }
 
 
