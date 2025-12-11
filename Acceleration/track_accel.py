@@ -296,6 +296,7 @@ def main():
             # Correct output for Code B
             if inputs["trigger"] == 1:
                 print(json.dumps(sync_packet), flush=True)
+                print(results)
             # 4. Output to CSV (Disk)
             writer.writerow([
                 results['ts'], results['vel'], results['gauge'], 
