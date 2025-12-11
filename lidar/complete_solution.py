@@ -684,7 +684,7 @@ class EnhancedProcessor:
             if trigger_state.trigger == 1:
                 packet = build_lidar_packet(detections)
                 print(json.dumps(packet), flush=True)
-            
+                print(packet)
             return detections
 
     def _simple_clustering(self, pcd):
@@ -840,4 +840,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
