@@ -4,7 +4,131 @@ import time
 import os
 from ultralytics import YOLO
 from datetime import datetime
+import serial
+import re
+import sys
 
+# ============================
+# GLOBAL TIMESTAMP READER
+# ============================
+TS_FILE = "/tmp/global_timestamp.txt"
+_last_ts = "NO_TIMESTAMP"
+_last_read = 0
+
+def get_global_timestamp():
+    global _last_ts, _last_read
+    now = time.time()
+    if now - _last_read >= 0.005:
+        try:
+            with open(TS_FILE, "r") as f:
+                _last_ts = f.read().strip()
+        except:
+            _last_ts = "NO_TIMESTAMP"
+        _last_read = now
+    return _last_ts
+
+# ============================
+# SYNC PACKET BUILDER
+# ============================
+def build_fastener_packet(image_path, confidence, velocity):
+    return {
+        "timestamp": get_global_timestamp(),
+        "subsystem": "track_component",
+        "component_type": "fastener",
+        "status": "defective",
+        "defect_type": "missing_fastener",
+        "confidence": round(confidence, 3),
+        "image_path": image_path,
+        "velocity": velocity   # optional
+    }
+
+# ============================
+# UART CONFIG
+# ============================
+UART_PORT = "/dev/ttyTHS1"      # Change per subsystem if needed
+BAUD_RATE = 115200
+UART_TIMEOUT = 0.5
+# ============================
+# SHARED UART STATE
+# ============================
+class UARTState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = {}       # stores the latest parsed key/value pairs
+
+    def update(self, parsed_dict):
+        with self.lock:
+            for k, v in parsed_dict.items():
+                self.data[k] = v
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.data)
+
+uart_state = UARTState()
+
+# ============================
+# REGEX PARSER FOR UART LINES
+# (Handles key:value pairs in ANY order)
+# ============================
+UART_REGEX = re.compile(r"([A-Za-z0-9_]+)\s*[:=]\s*([-\d\.]+)")
+
+def parse_uart_line(line):
+    """
+    Takes a UART line like:
+      'D1:123 D2:456 Velocity:12.3 Trigger:1'
+    Returns:
+      {'D1':123, 'D2':456, 'Velocity':12.3, 'Trigger':1}
+    """
+    matches = UART_REGEX.findall(line)
+    parsed = {}
+
+    for key, val in matches:
+        try:
+            # Auto-convert numeric fields
+            if "." in val:
+                parsed[key] = float(val)
+            else:
+                parsed[key] = int(val)
+        except:
+            parsed[key] = val  # fallback as string
+
+    return parsed
+
+# ============================
+# UART WORKER THREAD
+# Reads lines & stores parsed results
+# ============================
+def uart_worker():
+    while True:
+        try:
+            ser = serial.Serial(
+                UART_PORT,
+                BAUD_RATE,
+                timeout=UART_TIMEOUT
+            )
+            sys.stderr.write(f"[UART] Connected on {UART_PORT}\n")
+            break
+        except Exception as e:
+            sys.stderr.write(f"[UART] Failed to open: {e}\n")
+            time.sleep(1)
+
+    ser.reset_input_buffer()
+
+    while True:
+        try:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+
+            parsed = parse_uart_line(line)
+
+            if parsed:
+                uart_state.update(parsed)
+
+        except Exception as e:
+            sys.stderr.write(f"[UART] Error: {e}\n")
+            continue
 # =====================================================================
 # Configuration
 # =====================================================================
@@ -26,7 +150,7 @@ os.makedirs(SAVE_PATH, exist_ok=True)
 model = YOLO(MODEL_PATH)
 model.fuse()
 print("Model loaded.")
-
+threading.Thread(target=uart_worker, daemon=True).start()
 # =====================================================================
 # Threaded camera class
 # =====================================================================
@@ -62,20 +186,18 @@ time.sleep(1)
 # =====================================================================
 
 def save_bad_fastener(frame, box, confidence, class_name):
-    """Save image with missing fastener detection"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     filename = f"{class_name}_{timestamp}_{confidence:.2f}.jpg"
     filepath = os.path.join(SAVE_PATH, filename)
-    
-    # Crop the region around the fastener with padding
+
     x1, y1, x2, y2 = map(int, box)
     padding = 20
-    cropped = frame[max(0, y1-padding):min(frame.shape[0], y2+padding), 
+    cropped = frame[max(0, y1-padding):min(frame.shape[0], y2+padding),
                     max(0, x1-padding):min(frame.shape[1], x2+padding)]
-    
-    # Save the cropped image
+
     cv2.imwrite(filepath, cropped)
     print(f"Missing fastener detected and saved: {filepath}")
+    return filepath
 
 # =====================================================================
 # Inference loop
@@ -130,7 +252,19 @@ while True:
                 # Draw red bounding box for missing fastener
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
                 # Save the missing fastener image
-                save_bad_fastener(frame, (x1, y1, x2, y2), conf, class_name)
+                filepath = save_bad_fastener(frame, (x1, y1, x2, y2), conf, class_name)
+                # ===============================
+                # ONLY SEND PACKET IF TRIGGER == 1
+                # ===============================
+                uart_data = uart_state.snapshot()
+                
+                trigger = uart_data.get("Trigger", uart_data.get("Triger", 0))
+                velocity = uart_data.get("Velocity", uart_data.get("Vel", 0.0))
+                
+                if trigger == 1:
+                    sync_packet = build_fastener_packet(filepath, conf, velocity)
+                    print(json.dumps(sync_packet), flush=True)
+                
                 # Draw text with red background
                 cv2.putText(frame, label, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
