@@ -11,6 +11,8 @@ mkfifo /tmp/xsens_pipe
 rm -f /tmp/track_geo
 mkfifo /tmp/track_geo
 ./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe |python3 tof_stm32_interface/complete_track_geometry.py > /tmp/track_geo
+source deactivate
 python -m venv envs
+source envs/bin/activate
 pip install -r condition/requirements.txt
 /home/nvidia/env_s/bin/python3 condition/ml.py
