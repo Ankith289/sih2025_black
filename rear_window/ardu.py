@@ -1,23 +1,26 @@
-
 import cv2
 import threading
 import time
+import os
 
-# --- Configuration ---
-# IMPORTANT: Verify these sensor-ids with `v4l2-ctl --list-devices`
-CAMERA_IDS = [0]
-
-# Video settings (adjust to your camera's capabilities)
+# -------------------------------
+# Configuration
+# -------------------------------
+CAMERA_IDS = [0]                      # MIPI CSI camera ID
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 FRAME_RATE = 30
 
-# --- Global variables for thread communication ---
+WEB_FRAME_PATH = "/home/nvidia/rail-inspection-app/public/rear_window/frame.jpg"
+VIDEO_OUTPUT_PATH = "rear_window_recording.mp4"
+
 latest_frames = {}
 frames_lock = threading.Lock()
 stop_event = threading.Event()
 
-# --- GStreamer Pipeline Function ---
+# -------------------------------
+# GStreamer Pipeline
+# -------------------------------
 def gstreamer_pipeline(
     sensor_id=0,
     capture_width=1280,
@@ -27,35 +30,25 @@ def gstreamer_pipeline(
     framerate=30,
     flip_method=0,
 ):
-    """
-    Constructs a GStreamer pipeline for capturing video from a MIPI CSI camera on a Jetson.
-    """
     return (
         "nvarguscamerasrc sensor-id=%d ! "
         "video/x-raw(memory:NVMM), width=(int)%d, height=(int)%d, framerate=(fraction)%d/1 ! "
         "nvvidconv flip-method=%d ! "
-        "video/x-raw, width=(int)%d, height=(int)%d, format=(string)BGRx ! "
-        "videoconvert ! "
-        "video/x-raw, format=(string)BGR ! appsink"
+        "video/x-raw, width=(int)%d, height=(int)%d, format=BGRx ! "
+        "videoconvert ! video/x-raw, format=BGR ! appsink"
         % (
-            sensor_id,
-            capture_width,
-            capture_height,
-            framerate,
-            flip_method,
-            display_width,
-            display_height,
+            sensor_id, capture_width, capture_height,
+            framerate, flip_method,
+            display_width, display_height
         )
     )
 
-# --- Camera Capture Thread Function ---
+# -------------------------------
+# Camera Thread
+# -------------------------------
 def capture_thread_func(sensor_id):
-    """
-    This function is executed by each thread to capture frames from one camera.
-    """
-    print(f"📹 Capture thread for Camera {sensor_id}: Starting...")
+    print(f"[INFO] Starting camera {sensor_id} capture thread...")
 
-    # 1. Create GStreamer pipeline and VideoCapture object
     pipeline = gstreamer_pipeline(
         sensor_id=sensor_id,
         capture_width=FRAME_WIDTH,
@@ -64,70 +57,82 @@ def capture_thread_func(sensor_id):
         display_height=FRAME_HEIGHT,
         framerate=FRAME_RATE
     )
+
     cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
     if not cap.isOpened():
-        print(f"❌ ERROR: Capture thread for Camera {sensor_id}: Cannot open camera.")
+        print(f"[ERROR] Cannot open camera {sensor_id}")
         return
 
-    # 2. Frame capture loop
+    # -------------------------------
+    # Video Recorder (Jetson HW Encoder)
+    # -------------------------------
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(
+        VIDEO_OUTPUT_PATH, fourcc, FRAME_RATE, (FRAME_WIDTH, FRAME_HEIGHT)
+    )
+
+    if not video_writer.isOpened():
+        print("[WARNING] Video writer failed to open. Video will NOT be saved.")
+
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            print(f"⚠️ WARNING: Capture thread for Camera {sensor_id}: No frame received. Exiting.")
+            print(f"[WARN] Camera {sensor_id}: No frame received.")
             break
 
-        # Use a lock to safely update the shared dictionary
+        # Update latest frame for display
         with frames_lock:
             latest_frames[sensor_id] = frame
 
-    # 3. Release resources
+        # Save to web app
+        try:
+            cv2.imwrite(WEB_FRAME_PATH, frame)
+        except:
+            pass
+
+        # Save video
+        try:
+            if video_writer.isOpened():
+                video_writer.write(frame)
+        except:
+            pass
+
     cap.release()
-    print(f"⏹️ Capture thread for Camera {sensor_id}: Stopped.")
+    if video_writer.isOpened():
+        video_writer.release()
+
+    print(f"[INFO] Camera {sensor_id} thread stopped.")
 
 
-# --- Main Execution ---
+# -------------------------------
+# Main
+# -------------------------------
 if __name__ == "__main__":
+    print("[SYSTEM] Starting rear-window subsystem...")
+
+    # Ensure web app frame directory exists
+    os.makedirs(os.path.dirname(WEB_FRAME_PATH), exist_ok=True)
+
     threads = []
 
-    print("🚀 Starting all camera capture threads...")
-
-    # Create and start a capture thread for each camera
     for cam_id in CAMERA_IDS:
-        thread = threading.Thread(target=capture_thread_func, args=(cam_id,))
-        threads.append(thread)
-        thread.start()
+        t = threading.Thread(target=capture_thread_func, args=(cam_id,))
+        t.start()
+        threads.append(t)
 
-    print("\n✅ All capture threads started. Main display loop is running.")
-    print("Press 'q' in any camera window to quit.")
+    print("[SYSTEM] Capture threads running. Video recording started.")
+    print("[SYSTEM] Press CTRL+C to stop.")
 
-    # Main loop to display frames from all threads
     try:
         while True:
-            # Check if any frames are available
-            if not latest_frames:
-                time.sleep(0.1)
-                continue
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("[SYSTEM] Shutting down...")
 
-            with frames_lock:
-                # Iterate over a copy of the items to avoid issues if the dict changes
-                for sensor_id, frame in list(latest_frames.items()):
-                    if frame is not None:
-                        window_name = f"Camera {sensor_id}"
-                        cv2.imshow(window_name, frame)
+    stop_event.set()
 
-            # Check for quit key
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("Quit key pressed. Shutting down...")
-                break
-    finally:
-        # 1. Signal all threads to stop
-        stop_event.set()
+    for t in threads:
+        t.join()
 
-        # 2. Wait for all threads to complete
-        for thread in threads:
-            thread.join()
-
-        # 3. Close all OpenCV windows
-        cv2.destroyAllWindows()
-        print("🎉 All threads terminated and windows closed. Program finished.")
+    print("[SYSTEM] All threads stopped. Rear window subsystem terminated.")
