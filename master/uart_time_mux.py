@@ -70,12 +70,12 @@ def main():
             if not line:
                 continue
 
-            parsed = parse_uart(line)
+            parsed = parse_uart_line(line)
             if not parsed:
                 continue
 
             # 1) Write global timestamp file
-            write_timestamp(parsed["timestamp"])
+            parsed["timestamp"] = datetime.now().isoformat()
 
             # 2) Publish packet to all subscribers
             pub.send_json(parsed)
