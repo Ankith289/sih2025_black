@@ -33,3 +33,15 @@ source envs/bin/activate
 pip install -r condition/requirements.txt
 deactivate
 
+# ENV 3: works on track_geo_env
+
+# -------------------------------
+# ENV 2: For ml.py
+# -------------------------------
+
+python -m venv envl
+sudo chown -R $USER:$USER /home/nvidia/sih2025_black/envs
+source envl/bin/activate
+pip install -r lidar/req.txt
+deactivate
+
