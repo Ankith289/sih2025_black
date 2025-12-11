@@ -54,54 +54,44 @@ def get_global_timestamp():
 # 1. PURE CALCULATION FUNCTION
 # ============================
 
-def calculate_track_parameters(d1, d2, velocity, ay, az, prev_cross, prev_time):
+def calculate_track_parameters(d1, d2, velocity, ay, az, prev_cross, prev_chain):
     """
-    Performs all physics and geometry calculations.
-    Returns: (results_dict, updated_cross_level, updated_timestamp)
+    Performs track geometry calculations using TF-Minis + IMU + chainage.
     """
-    now = time.time()
-    
-    # --- A. GAUGE WIDTH ---
-    # Formula: d1*sin(30) + d2*sin(60)
+
+    # Handle invalid TF-Mini data
+    if d2 == 65535:
+        d2 = 0
+
+    # Gauge
     gauge = (d1 * math.sin(ANGLE1)) + (d2 * math.sin(ANGLE2))
 
-    # --- B. CROSS LEVEL (CANT) ---
-    # Calculate tilt angle from accelerometer (ay, az)
-    # atan2 handles the division by zero if az is 0
-    down= math.sqrt(pow(abs(ay),2)+pow(abs(az),2))
-    if 9 < down and down < 10 and abs(az)<9:
-        cross_level_angle = math.degrees(math.asin(az/down))
-        cross_level= math.sin(math.radians(cross_level_angle))*gauge
+    # Cross level: tilt from accelerometer
+    down = math.sqrt(ay*ay + az*az)
+    if 9.0 < down < 10.1 and abs(az) < 9.0:
+        angle = math.asin(az / down)
+        cross_level = math.sin(angle) * gauge
     else:
-        cross_level=0
-    # --- C. TWIST (Spatial) ---
-    # Twist = (Change in Cross Level) / (Distance Traveled)
-    twist = 0.0
-    
-    if prev_time is not None:
-        dt = now - prev_time
-        
-        # Only calculate twist if moving > 0.5 m/s
-        if dt > 0 and abs(velocity) > 0.5:
-            dist_traveled = velocity * dt
-            
-            # Prevent division by tiny distances (noise)
-            if dist_traveled > 0.001:
-                twist = (cross_level - prev_cross) / dist_traveled
+        cross_level = 0
 
-    # Pack results
+    # Twist from chainage difference
+    twist = 0.0
+    if prev_chain is not None and abs(chainage - prev_chain) > 0.001:
+        delta = chainage - prev_chain
+        twist = (cross_level - prev_cross) / delta
+
     results = {
-        "ts": round(now, 3),
+        "ts": round(time.time(), 3),
         "vel": round(velocity, 2),
         "gauge": round(gauge, 2),
         "cross": round(cross_level, 2),
-        "twist": round(twist, 2),
+        "twist": round(twist, 4),
         "d1": int(d1),
-        "d2": int(d2)
+        "d2": int(d2),
+        "chainage": chainage
     }
 
-    return results, cross_level, now
-
+    return results, cross_level, chainage
 
 # ============================
 # 2. SHARED MEMORY & THREADS
@@ -152,21 +142,24 @@ class SystemState:
     def __init__(self):
         self.lock = threading.Lock()
         self.data = {
-            "d1": 0, "d2": 0, "velocity": 0.0, "trigger": 0,
-            "ay": 0.0, "az": 9.8  # Default gravity
+            "d1": 0, "d2": 0,
+            "velocity": 0.0,
+            "trigger": 0,
+            "chainage": 0.0,   # <-- NEW
+            "ay": 0.0, "az": 9.8
         }
-
     def update_imu(self, ay, az):
         with self.lock:
             self.data["ay"] = ay
             self.data["az"] = az
 
-    def update_uart(self, d1, d2, vel, trig):
+    def update_uart(self, d1, d2, vel, trig, chainage):
         with self.lock:
             self.data["d1"] = d1
             self.data["d2"] = d2
             self.data["velocity"] = vel
             self.data["trigger"] = trig
+            self.data["chainage"] = chainage
 
     def get_snapshot(self):
         with self.lock:
@@ -190,34 +183,42 @@ def imu_worker():
                     except: pass
     except: pass
 
+
 def uart_worker():
     try:
         ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=1)
         ser.reset_input_buffer()
         sys.stderr.write(f"UART: Connected ({UART_PORT}).\n")
-    except: return
+    except:
+        return
 
-    regex = re.compile(r"(D1|D2|Velocity|Triger)\s*:\s*([\d\.]+)")
+    # Now also parses: Distance:<value>
+    regex = re.compile(r"(D1|D2|Velocity|Triger|Distance)\s*:\s*([\d\.]+)")
     
     while True:
         try:
             line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if not line: continue
+            if not line:
+                continue
+
             matches = regex.findall(line)
-            if matches:
-                # Create a temporary dict to update all fields at once
-                updates = {}
-                for k, v in matches: updates[k] = float(v)
-                
-                # Only update if we got valid data
-                if 'D1' in updates:
-                    state.update_uart(
-                        int(updates.get('D1', 0)),
-                        int(updates.get('D2', 0)),
-                        updates.get('Velocity', 0.0),
-                        int(updates.get('Triger', 0))
-                    )
-        except: pass
+            if not matches:
+                continue
+
+            updates = {}
+            for key, val in matches:
+                updates[key] = float(val)
+
+            if "D1" in updates:
+                state.update_uart(
+                    d1=int(updates.get("D1", 0)),
+                    d2=int(updates.get("D2", 0)),
+                    vel=updates.get("Velocity", 0.0),
+                    trig=int(updates.get("Triger", 0)),
+                    chainage=updates.get("Distance", 0.0)
+                )
+        except:
+            pass
 
 # ============================
 # SYNC PACKET BUILDER
@@ -275,14 +276,14 @@ def main():
 
             vertical_unevenness, ride_rms = ride_quality.calculate_metrics()
             # 2. CALL THE CALCULATION FUNCTION
-            results, prev_cross, prev_time = calculate_track_parameters(
+            results, prev_cross, prev_chain = calculate_track_parameters(
                 d1=inputs['d1'],
                 d2=inputs['d2'],
                 velocity=inputs['velocity'],
                 ay=inputs['ay'],
                 az=inputs['az'],
                 prev_cross=prev_cross,
-                prev_time=prev_time
+                prev_chain=prev_chain
             )
             results["unevenness"] = round(vertical_unevenness, 3)
             results["ride_index"] = round(ride_rms, 3)
@@ -298,7 +299,8 @@ def main():
                 results['d1'], results['d2'], 
                 inputs['ay'], inputs['az'],
                 results["unevenness"],
-                results["ride_index"]
+                results["ride_index"],
+                results["chainage"]
             ])
             log_file.flush()
 
