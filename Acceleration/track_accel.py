@@ -11,6 +11,7 @@ import signal
 import copy
 import collections
 import statistics
+import zmq
 
 # ============================
 # CONFIGURATION
@@ -49,6 +50,39 @@ def get_global_timestamp():
         _last_read = now
 
     return _last_ts
+# ============================
+# NEW UART RECEIVER (ZEROMQ SUBSCRIBER)
+# ============================
+MASTER_ADDR = "tcp://127.0.0.1:6000"
+
+def uart_zmq_worker():
+    """
+    Subsystem listens for UART data published by the central UART Time Master.
+    """
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(MASTER_ADDR)
+
+    # Subscribe to ALL messages
+    sub.setsockopt_string(zmq.SUBSCRIBE, "")
+
+    sys.stderr.write("[UART-SUB] Connected to UART Master via ZMQ.\n")
+
+    while True:
+        try:
+            msg = sub.recv_json()
+            # msg contains: d1, d2, velocity, trigger, distance, timestamp
+
+            state.update_uart(
+                msg.get("d1", 0),
+                msg.get("d2", 0),
+                msg.get("velocity", 0.0),
+                msg.get("trigger", 0)
+            )
+
+        except Exception as e:
+            sys.stderr.write(f"[UART-SUB] Error: {e}\n")
+            time.sleep(0.1)
 
 # ============================
 # 1. PURE CALCULATION FUNCTION
@@ -190,35 +224,6 @@ def imu_worker():
                     except: pass
     except: pass
 
-def uart_worker():
-    try:
-        ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=1)
-        ser.reset_input_buffer()
-        sys.stderr.write(f"UART: Connected ({UART_PORT}).\n")
-    except: return
-
-    regex = re.compile(r"(D1|D2|Velocity|Triger)\s*:\s*([\d\.]+)")
-    
-    while True:
-        try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if not line: continue
-            matches = regex.findall(line)
-            if matches:
-                # Create a temporary dict to update all fields at once
-                updates = {}
-                for k, v in matches: updates[k] = float(v)
-                
-                # Only update if we got valid data
-                if 'D1' in updates:
-                    state.update_uart(
-                        int(updates.get('D1', 0)),
-                        int(updates.get('D2', 0)),
-                        updates.get('Velocity', 0.0),
-                        int(updates.get('Triger', 0))
-                    )
-        except: pass
-
 # ============================
 # SYNC PACKET BUILDER
 # ============================
@@ -249,7 +254,7 @@ def build_sync_packet(results):
 def main():
     # Start inputs
     threading.Thread(target=imu_worker, daemon=True).start()
-    threading.Thread(target=uart_worker, daemon=True).start()
+    threading.Thread(target=uart_zmq_worker, daemon=True).start()
 
     # Setup Logging
     log_file = open(CSV_FILE_PATH, 'a', newline='')
