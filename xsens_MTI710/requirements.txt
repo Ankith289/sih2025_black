@@ -9,4 +9,5 @@ pillow
 pyparsing
 pyserial==3.5
 python-dateutil
+pyzmq
 six
