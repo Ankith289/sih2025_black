@@ -289,7 +289,8 @@ def main():
             # 3. Output to Pipe (Web)
             sync_packet = build_sync_packet(results)
             # Correct output for Code B
-            print(json.dumps(sync_packet), flush=True)
+            if inputs["trigger"] == 1:
+                print(json.dumps(sync_packet), flush=True)
             # 4. Output to CSV (Disk)
             writer.writerow([
                 results['ts'], results['vel'], results['gauge'], 
