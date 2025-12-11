@@ -1,76 +1,148 @@
-import time
-import requests
+import sys
 import json
-from fastapi import FastAPI, Request
-import uvicorn
+import time
+import threading
+from flask import Flask, request, jsonify
 
-app = FastAPI()
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+SYNC_TIMEOUT = 0.050   # 50 ms window allowed for sync fusion
+PRINT_FUSED = True     # Send only fused packets to Code A (WS forwarder)
 
-# Storage for 6 subsystems
-data_buf = {
+# ==========================================================
+# SUBSYSTEM BUFFER
+# ==========================================================
+subsystems = {
     "track_geometry": None,
-    "rail_profile": None,
     "track_component": None,
     "acceleration": None,
-    "infringement": None,
-    "rear_video": None   # video handled separately (optional)
+    # ADD MORE SUBSYSTEMS HERE IF YOU NEED:
+    # "rear_video": None,
+    # "profile_wear": None,
+    # "infringement": None,
 }
 
-# ------------------------------------------------------------
-# RECEIVE SUBSYSTEM DATA
-# ------------------------------------------------------------
-@app.post("/subsystem/{name}")
-async def recv_subsystem(name: str, request: Request):
-    if name not in data_buf:
-        return {"error": "invalid subsystem"}
+lock = threading.Lock()
 
-    payload = await request.json()
-    payload["_server_ts"] = time.time()
-    data_buf[name] = payload
+# Store when each subsystem last updated
+timestamps = {name: 0 for name in subsystems}
 
-    fused = synchronize()
-    if fused:
-        push_to_code_a(fused)
+# ==========================================================
+# FUNCTION: CHECK IF ALL REQUIRED DATA ARRIVED
+# ==========================================================
+def all_ready():
+    with lock:
+        return all(subsystems[name] is not None for name in subsystems)
 
-    return {"status": "ok"}
+# ==========================================================
+# FUNCTION: FUSE DATA FROM ALL SUBSYSTEMS
+# ==========================================================
+def build_fused_packet():
+    with lock:
+        fused = {
+            "timestamp": subsystems["track_geometry"]["timestamp"],  # master timestamp
+            "track_geometry": subsystems["track_geometry"],
+            "track_component": subsystems["track_component"],
+            "acceleration": subsystems["acceleration"],
+            # ADD THE OTHER SUBSYSTEMS HERE
+        }
+    return fused
 
-# ------------------------------------------------------------
-# TIMESTAMP SYNCHRONIZATION LOGIC
-# ------------------------------------------------------------
-def synchronize():
-    non_video = ["track_geometry", "rail_profile", "track_component", "acceleration", "infringement"]
 
-    # Check if all subsystems have data
-    if any(data_buf[s] is None for s in non_video):
-        return None
+# ==========================================================
+# FUNCTION: CLEAR BUFFERS AFTER FUSION
+# ==========================================================
+def clear_subsystems():
+    with lock:
+        for k in subsystems:
+            subsystems[k] = None
 
-    ts_vals = [data_buf[s]["timestamp"] for s in non_video]
 
-    if max(ts_vals) - min(ts_vals) > 0.05:
-        return None  # timestamps not aligned
+# ==========================================================
+# THREAD: STDIN SUBSYSTEM READER (Python Local Processes)
+# ==========================================================
+def stdin_reader():
+    """Reads JSON packets from Python subsystems."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
 
-    return {
-        "type": "fused_packet",
-        "timestamp": time.time(),
-        "track_geometry": data_buf["track_geometry"],
-        "rail_profile": data_buf["rail_profile"],
-        "track_component": data_buf["track_component"],
-        "acceleration": data_buf["acceleration"],
-        "infringement": data_buf["infringement"]
-    }
+        try:
+            pkt = json.loads(line)
+            name = pkt.get("subsystem", None)
+            ts = pkt.get("timestamp", None)
 
-# ------------------------------------------------------------
-# SEND PROCESSED DATA TO CODE A (WEBSOCKET HANDLER)
-# ------------------------------------------------------------
-def push_to_code_a(data):
-    try:
-        requests.post("http://localhost:5001/push", json=data)
-        print("Sent fused data to Code A")
-    except Exception as e:
-        print("Error sending to Code A:", e)
+            if name not in subsystems:
+                continue
 
-# ------------------------------------------------------------
-# RUN ON PORT 5000
-# ------------------------------------------------------------
+            with lock:
+                subsystems[name] = pkt
+                timestamps[name] = time.time()
+
+        except Exception as e:
+            sys.stderr.write(f"[CodeB] JSON error: {e}\n")
+
+
+# ==========================================================
+# THREAD: SYNC FUSION LOOP
+# ==========================================================
+def sync_loop():
+    while True:
+        time.sleep(0.005)  # 200 Hz check
+
+        if not all_ready():
+            continue
+
+        # Check if data timestamps are within timeout window
+        t_now = time.time()
+        with lock:
+            max_age = max(t_now - timestamps[s] for s in subsystems)
+
+        if max_age > SYNC_TIMEOUT:
+            # One subsystem is lagging / stale — wait more
+            continue
+
+        fused = build_fused_packet()
+
+        # Send fused packet to Code A (via print → pipe)
+        if PRINT_FUSED:
+            print(json.dumps(fused), flush=True)
+
+        clear_subsystems()
+
+
+# ==========================================================
+# OPTIONAL: HTTP SERVER FOR EXTERNAL SUBSYSTEMS (Port 5000)
+# ==========================================================
+app = Flask(__name__)
+
+@app.post("/subsystem/<name>")
+def http_subsystem(name):
+    if name not in subsystems:
+        return jsonify({"error": "unknown subsystem"}), 404
+
+    pkt = request.json
+    if not pkt:
+        return jsonify({"error": "empty packet"}), 400
+
+    with lock:
+        subsystems[name] = pkt
+        timestamps[name] = time.time()
+
+    return jsonify({"status": "ok"}), 200
+
+
+# ==========================================================
+# MAIN ENTRY POINT
+# ==========================================================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    # Start stdin reader
+    threading.Thread(target=stdin_reader, daemon=True).start()
+
+    # Start sync engine
+    threading.Thread(target=sync_loop, daemon=True).start()
+
+    # Start HTTP server for remote subsystems
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
