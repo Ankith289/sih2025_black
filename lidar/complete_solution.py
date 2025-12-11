@@ -16,6 +16,7 @@ import open3d as o3d
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+import zmq
 
 # Import from existing pipeline if available
 try:
@@ -30,6 +31,23 @@ try:
 except ImportError:
     print("⚠️  pipeline_utils.py not found - using simplified processing")
     PIPELINE_AVAILABLE = False
+
+
+TS_FILE = "/tmp/global_timestamp.txt"
+_last_ts = "NO_TIMESTAMP"
+_last_read = 0
+
+def get_global_timestamp():
+    global _last_ts, _last_read
+    now = time.time()
+    if now - _last_read >= 0.005:
+        try:
+            with open(TS_FILE, "r") as f:
+                _last_ts = f.read().strip()
+        except:
+            _last_ts = "NO_TIMESTAMP"
+        _last_read = now
+    return _last_ts
 
 
 # ============================================================================
@@ -68,6 +86,51 @@ class Config:
     # Web streaming
     WEB_UPDATE_INTERVAL = 0.1
     MAX_POINTS_WEB = 5000
+
+# ============================
+# ZMQ SUBSCRIBER (Trigger Only)
+# ============================
+MASTER_ADDR = "tcp://127.0.0.1:6000"
+
+class TriggerState:
+    def __init__(self):
+        self.trigger = 0
+
+    def update(self, t):
+        self.trigger = t
+
+trigger_state = TriggerState()
+
+def uart_trigger_worker():
+    """
+    Subscribes to UART Time Master and reads only `trigger`.
+    """
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.connect(MASTER_ADDR)
+    sub.setsockopt_string(zmq.SUBSCRIBE, "")
+    sys.stderr.write(f"[ZMQ] Listening to UART Master at {MASTER_ADDR}\n")
+
+    while True:
+        try:
+            msg = sub.recv_json()
+            trig = msg.get("trigger", 0)
+            trigger_state.update(trig)
+        except Exception as e:
+            sys.stderr.write(f"[ZMQ] Error: {e}\n")
+            time.sleep(0.1)
+
+threading.Thread(target=uart_trigger_worker, daemon=True).start()
+
+def build_lidar_packet(detections):
+    """
+    Convert LiDAR output into a subsystem packet for Code B.
+    """
+    return {
+        "subsystem": "infringement",
+        "timestamp": get_global_timestamp(),  # from /tmp/global_timestamp.txt
+        "detections": detections
+    }
 
 
 # ============================================================================
@@ -606,16 +669,23 @@ class EnhancedProcessor:
                 print("  ⚠️  Using DEBUG detection (non-ground bbox)")
                 detections = [debug_det]
 
-        frame_data = {
-            'points': raw_points.tolist(),
-            'detections': detections
-        }
-
-        json_path = self.web_manager.export_frame(frame_data)
-        print(f"  ✅ Exported: {json_path}")
-        print(f"  📊 Detections: {len(detections)}")
-
-        return detections
+            frame_data = {
+                'points': raw_points.tolist(),
+                'detections': detections
+            }
+            
+            json_path = self.web_manager.export_frame(frame_data)
+            print(f"  ✅ Exported: {json_path}")
+            print(f"  📊 Detections: {len(detections)}")
+            
+            # ============================
+            # SEND TO CODE-B ONLY ON TRIGGER
+            # ============================
+            if trigger_state.trigger == 1:
+                packet = build_lidar_packet(detections)
+                print(json.dumps(packet), flush=True)
+            
+            return detections
 
     def _simple_clustering(self, pcd):
         """Simple clustering using Open3D DBSCAN"""
@@ -770,3 +840,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
