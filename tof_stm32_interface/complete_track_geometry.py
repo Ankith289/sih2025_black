@@ -26,6 +26,31 @@ ANGLE1 = math.radians(30)
 ANGLE2 = math.radians(60)
 
 # ============================
+# GLOBAL TIMESTAMP READER (SAFE)
+# ============================
+TS_FILE = "/tmp/global_timestamp.txt"
+_last_ts = "NO_TIMESTAMP"
+_last_read = 0
+
+def get_global_timestamp():
+    """
+    Reads shared timestamp at most every 5ms.
+    Prevents heavy I/O across 6 subsystems.
+    """
+    global _last_ts, _last_read
+    now = time.time()
+
+    if now - _last_read >= 0.005:  # Read file max 200 Hz
+        try:
+            with open(TS_FILE, "r") as f:
+                _last_ts = f.read().strip()
+        except:
+            _last_ts = "NO_TIMESTAMP"
+        _last_read = now
+
+    return _last_ts
+
+# ============================
 # 1. PURE CALCULATION FUNCTION
 # ============================
 
@@ -194,6 +219,28 @@ def uart_worker():
                     )
         except: pass
 
+# ============================
+# SYNC PACKET BUILDER
+# ============================
+def build_sync_packet(results):
+    """
+    Convert Track Geometry results into a unified packet
+    that Code B (synchronizer) understands.
+    """
+    return {
+        "timestamp": get_global_timestamp(),  # string timestamp
+        "subsystem": "track_geometry",
+        "gauge": results["gauge"],
+        "cross_level": results["cross"],
+        "twist": results["twist"],
+        "unevenness": results["unevenness"],
+        "ride_index": results["ride_index"],
+        "chainage": results.get("chainage", 0.0),
+        "velocity": results.get("vel", 0.0),
+        "d1": results["d1"],
+        "d2": results["d2"]
+    }
+
 
 # ============================
 # 3. MAIN LOOP
@@ -240,8 +287,9 @@ def main():
             results["unevenness"] = round(vertical_unevenness, 3)
             results["ride_index"] = round(ride_rms, 3)
             # 3. Output to Pipe (Web)
-            print(json.dumps(results), flush=True)
-
+            sync_packet = build_sync_packet(results)
+            # Correct output for Code B
+            print(json.dumps(sync_packet), flush=True)
             # 4. Output to CSV (Disk)
             writer.writerow([
                 results['ts'], results['vel'], results['gauge'], 
