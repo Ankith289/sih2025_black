@@ -16,5 +16,12 @@ source envs/bin/activate;
 python3 condition/ml.py;
 exec bash
 "
+# ================================================
+# Open TERMINAL 3 → run complete_track_geometry loop
+# ================================================
+gnome-terminal -- bash -c "
+source env/bin/activate;
+./xsens_MTI710/mti710_force_log > /tmp/xsens_pipe | python3 Acceleration/track_accel.py;
+exec bash
+"
 
-echo "Both processes launched in separate terminals."
