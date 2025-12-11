@@ -225,7 +225,7 @@ def main():
 
         if inputs["trigger"] == 1:
             print(json.dumps(build_sync_packet(results)), flush=True)
-
+            print(results)
         writer.writerow([
             results['ts'], results['vel'], results['gauge'],
             results['cross'], results['twist'], results['d1'],
