@@ -16,11 +16,12 @@ PRINT_FUSED = True     # Send only fused packets to Code A (WS forwarder)
 subsystems = {
     "track_geometry": None,
     "track_component": None,
+    "profile_wear": None,
     "acceleration": None,
     # ADD MORE SUBSYSTEMS HERE IF YOU NEED:
-    # "rear_video": None,
-    # "profile_wear": None,
-    # "infringement": None,
+    "rear_video": None,
+    "profile_wear": None,
+    "infringement": None,
 }
 
 lock = threading.Lock()
@@ -146,3 +147,4 @@ if __name__ == "__main__":
 
     # Start HTTP server for remote subsystems
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+
