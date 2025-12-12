@@ -1,150 +1,70 @@
+#!/usr/bin/env python3
 import sys
 import json
+import asyncio
+import websockets
 import time
-import threading
-from flask import Flask, request, jsonify
 
-# ==========================================================
-# CONFIGURATION
-# ==========================================================
-SYNC_TIMEOUT = 0.050   # 50 ms window allowed for sync fusion
-PRINT_FUSED = True     # Send only fused packets to Code A (WS forwarder)
+WS_URL = "ws://192.168.0.10:4000/ws/track-data"
 
-# ==========================================================
-# SUBSYSTEM BUFFER
-# ==========================================================
-subsystems = {
-    "track_geometry": None,
-    "track_component": None,
-    "profile_wear": None,
-    "acceleration": None,
-    # ADD MORE SUBSYSTEMS HERE IF YOU NEED:
-    "rear_video": None,
-    "profile_wear": None,
-    "infringement": None,
-}
+# ============================================================
+# ASYNC SENDER TO THE WEB BACKEND
+# ============================================================
 
-lock = threading.Lock()
+async def send_to_websocket(queue):
+    """Connects to WS and sends packets from the queue."""
+    while True:
+        try:
+            print(f"[WS] Connecting to {WS_URL} ...")
+            async with websockets.connect(WS_URL, max_size=10_000_000) as ws:
+                print("[WS] Connected!")
 
-# Store when each subsystem last updated
-timestamps = {name: 0 for name in subsystems}
+                # continuously send packets as they arrive
+                while True:
+                    packet = await queue.get()  # wait for new data
+                    await ws.send(packet)
+                    print("[WS] Sent:", packet[:100], "...")
+        
+        except Exception as e:
+            print(f"[WS] Error: {e}. Reconnecting in 2 sec...")
+            await asyncio.sleep(2)  # retry
 
-# ==========================================================
-# FUNCTION: CHECK IF ALL REQUIRED DATA ARRIVED
-# ==========================================================
-def all_ready():
-    with lock:
-        return all(subsystems[name] is not None for name in subsystems)
+# ============================================================
+# STDIN READER (READS FROM CODE-B)
+# ============================================================
 
-# ==========================================================
-# FUNCTION: FUSE DATA FROM ALL SUBSYSTEMS
-# ==========================================================
-def build_fused_packet():
-    with lock:
-        fused = {
-            "timestamp": subsystems["track_geometry"]["timestamp"],  # master timestamp
-            "track_geometry": subsystems["track_geometry"],
-            "track_component": subsystems["track_component"],
-            "acceleration": subsystems["acceleration"],
-            # ADD THE OTHER SUBSYSTEMS HERE
-        }
-    return fused
+async def read_stdin(queue):
+    """Reads fused JSON packets from Code-B via stdin."""
+    loop = asyncio.get_running_loop()
 
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            await asyncio.sleep(0.001)
+            continue
 
-# ==========================================================
-# FUNCTION: CLEAR BUFFERS AFTER FUSION
-# ==========================================================
-def clear_subsystems():
-    with lock:
-        for k in subsystems:
-            subsystems[k] = None
-
-
-# ==========================================================
-# THREAD: STDIN SUBSYSTEM READER (Python Local Processes)
-# ==========================================================
-def stdin_reader():
-    """Reads JSON packets from Python subsystems."""
-    for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
 
+        # Validate JSON before sending
         try:
-            pkt = json.loads(line)
-            name = pkt.get("subsystem", None)
-            ts = pkt.get("timestamp", None)
+            json.loads(line)
+            await queue.put(line)
+        except json.JSONDecodeError:
+            print("[receiver] Invalid JSON from Code-B:", line)
 
-            if name not in subsystems:
-                continue
+# ============================================================
+# MAIN
+# ============================================================
 
-            with lock:
-                subsystems[name] = pkt
-                timestamps[name] = time.time()
+async def main():
+    queue = asyncio.Queue()
 
-        except Exception as e:
-            sys.stderr.write(f"[CodeB] JSON error: {e}\n")
+    await asyncio.gather(
+        send_to_websocket(queue),
+        read_stdin(queue)
+    )
 
-
-# ==========================================================
-# THREAD: SYNC FUSION LOOP
-# ==========================================================
-def sync_loop():
-    while True:
-        time.sleep(0.005)  # 200 Hz check
-
-        if not all_ready():
-            continue
-
-        # Check if data timestamps are within timeout window
-        t_now = time.time()
-        with lock:
-            max_age = max(t_now - timestamps[s] for s in subsystems)
-
-        if max_age > SYNC_TIMEOUT:
-            # One subsystem is lagging / stale — wait more
-            continue
-
-        fused = build_fused_packet()
-
-        # Send fused packet to Code A (via print → pipe)
-        if PRINT_FUSED:
-            print(json.dumps(fused), flush=True)
-
-        clear_subsystems()
-
-
-# ==========================================================
-# OPTIONAL: HTTP SERVER FOR EXTERNAL SUBSYSTEMS (Port 5000)
-# ==========================================================
-app = Flask(__name__)
-
-@app.post("/subsystem/<name>")
-def http_subsystem(name):
-    if name not in subsystems:
-        return jsonify({"error": "unknown subsystem"}), 404
-
-    pkt = request.json
-    if not pkt:
-        return jsonify({"error": "empty packet"}), 400
-
-    with lock:
-        subsystems[name] = pkt
-        timestamps[name] = time.time()
-
-    return jsonify({"status": "ok"}), 200
-
-
-# ==========================================================
-# MAIN ENTRY POINT
-# ==========================================================
 if __name__ == "__main__":
-    # Start stdin reader
-    threading.Thread(target=stdin_reader, daemon=True).start()
-
-    # Start sync engine
-    threading.Thread(target=sync_loop, daemon=True).start()
-
-    # Start HTTP server for remote subsystems
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-
+    asyncio.run(main())
