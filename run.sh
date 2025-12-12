@@ -40,7 +40,7 @@ deactivate
 # -------------------------------
 
 python -m venv envl
-sudo chown -R $USER:$USER /home/nvidia/sih2025_black/envs
+sudo chown -R $USER:$USER /home/nvidia/sih2025_black/envl
 source envl/bin/activate
 pip install -r lidar/req.txt
 deactivate
